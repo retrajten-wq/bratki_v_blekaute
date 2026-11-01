@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Молодые братки в блэкауте</title>
+    <link rel="stylesheet" href="style.css">
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+</head>
+<body>
+
+    <header class="site-header">
+        <div class="container header-inner">
+            <h1 class="site-title">Молодые братки в блэкауте</h1>
+            <p class="site-subtitle">читальня в темноте</p>
+            <button type="button" class="theme-toggle" id="themeToggle" aria-label="Переключить тему">
+                🌙 Тёмная
+            </button>
+        </div>
+    </header>
+
+    <main class="container">
+
+        <section class="hero">
+            <img class="avatar" src="images/logo.PNG" alt="Логотип: Молодые братки в блэкауте">
+            <p class="hero-caption">читальня в темноте</p>
+        </section>
+
+        <section class="upload-zone">
+            <button type="button" class="open-file-btn" id="openFileBtn">Открыть файл</button>
+            <input type="file" id="fileInput" accept=".pdf,.epub" hidden>
+            <p class="file-hint">(.pdf, .epub)</p>
+        </section>
+
+        <aside id="toc" class="toc" hidden>
+            <h2 class="toc-title">Оглавление</h2>
+            <div id="tocList" class="toc-list"></div>
+        </aside>
+
+        <article id="content" class="content">
+            <div class="placeholder">
+                <p>Выберите PDF или EPUB — текст появится здесь.</p>
+            </div>
+        </article>
+
+    </main>
+
+    <footer class="site-footer">
+        <div class="container">
+            <p>© 2026 · Молодые братки в блэкауте</p>
+        </div>
+    </footer>
+
+    <script>
+        pdfjsLib.GlobalWorkerOptions.workerSrc =
+            'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+        const openFileBtn = document.getElementById('openFileBtn');
+        const fileInput = document.getElementById('fileInput');
+        const contentDiv = document.getElementById('content');
+        const tocDiv = document.getElementById('toc');
+        const tocList = document.getElementById('tocList');
+        const themeToggle = document.getElementById('themeToggle');
+
+        let chapterCounter = 0;
+        let isRestoring = false;
+
+        /* ================= IndexedDB ================= */
+        function openDB() {
+            return new Promise((resolve, reject) => {
+                const request = indexedDB.open('ReaderDB', 1);
+                request.onupgradeneeded = (e) => {
+                    const db = e.target.result;
+                    if (!db.objectStoreNames.contains('files')) db.createObjectStore('files');
+                    if (!db.objectStoreNames.contains('positions')) db.createObjectStore('positions');
+                };
+                request.onsuccess = () => resolve(request.result);
+                request.onerror = () => reject(request.error);
+            });
+        }
+
+        async function saveFileToDB(file) {
+            const db = await openDB();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction('files', 'readwrite');
+                tx.objectStore('files').put(file, 'currentFile');
+                tx.oncomplete = () => resolve();
+                tx.onerror = () => reject(tx.error);
+            });
+        }
+
+        async function loadFileFromDB() {
+            const db = await openDB();
+            return new Promise((resolve) => {
+                const tx = db.transaction('files', 'readonly');
+                const req = tx.objectStore('files').get('currentFile');
+                req.onsuccess = () => resolve(req.result || null);
+                req.onerror = () => resolve(null);
+            });
+        }
+
+        async function savePosition(id) {
+            const db = await openDB();
+            return new Promise((resolve) => {
+                const tx = db.transaction('positions', 'readwrite');
+                tx.objectStore('positions').put(id, 'lastChapter');
+                tx.oncomplete = () => resolve();
+            });
+        }
+
+        async function loadPosition() {
+            const db = await openDB();
+            return new Promise((resolve) => {
+                const tx = db.transaction('positions', 'readonly');
+                const req = tx.objectStore('positions').get('lastChapter');
+                req.onsuccess = () => resolve(req.result || null);
+                req.onerror = () => resolve(null);
+            });
+        }
+
+        /* ================= Тема ================= */
+        function applyTheme(theme) {
+            if (theme === 'light') {
+                document.body.classList.add('light');
+                themeToggle.textContent = '☀️ Светлая';
+            } else {
+                document.body.classList.remove('light');
+                themeToggle.textContent = '🌙 Тёмная';
+            }
+        }
+        applyTheme(localStorage.getItem('theme') || 'dark');
+        themeToggle.addEventListener('click', () => {
+            const isLight = document.body.classList.contains('light');
+            const t = isLight ? 'dark' : 'light';
+            applyTheme(t);
+            localStorage.setItem('theme', t);
+        });
+
+        /* ================= Открытие файла ================= */
+        openFileBtn.addEventListener('click', () => fileInput.click());
+
+        fileInput.addEventListener('change', async (event) => {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            contentDiv.innerHTML = '<p class="placeholder">Загрузка…</p>';
+            tocList.innerHTML = '';
+            tocDiv.hidden = true;
+            chapterCounter = 0;
+
+            if (!isRestoring) {
+                try { await saveFileToDB(file); } catch (e) { console.warn(e); }
+            }
+
+            const ext = file.name.split('.').pop().toLowerCase();
+            try {
+                if (ext === 'pdf') await renderPDFText(file);
+                else if (ext === 'epub') await renderEPUBText(file);
+                else contentDiv.innerHTML = '<p class="placeholder">Поддерживаются только PDF и EPUB.</p>';
+
+                const lastId = await loadPosition();
+                if (lastId) {
+                    setTimeout(() => {
+                        const el = document.getElementById(lastId);
+                        if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    }, 300);
+                }
+            } catch (err) {
+                console.error(err);
+                contentDiv.innerHTML = '<p class="placeholder">Не удалось прочитать файл.</p>';
+            } finally {
+                isRestoring = false;
+            }
+        });
+
+        /* ================= Глава: добавить в текст и в оглавление ================= */
+        function addChapter(title, forcedId = null) {
+            chapterCounter++;
+            const id = forcedId || ('chapter-' + chapterCounter);
+
+            const anchor = document.createElement('span');
+            anchor.id = id;
+            anchor.className = 'chapter-anchor';
+            contentDiv.appendChild(anchor);
+
+            const heading = document.createElement('h2');
+            heading.className = 'chapter-heading';
+            heading.textContent = title;
+            contentDiv.appendChild(heading);
+
+            addTocLink(title, id);
+            tocDiv.hidden = false;
+        }
+
+        function addTocLink(title, id, level = 1) {
+            const link = document.createElement('a');
+            link.href = '#' + id;
+            link.textContent = title;
+            link.className = 'toc-link toc-level-' + level;
+            link.addEventListener('click', () => savePosition(id));
+            tocList.appendChild(link);
+        }
+
+        /* ================= PDF ================= */
+        async function renderPDFText(file) {
+            const buffer = await file.arrayBuffer();
+            const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
+
+            contentDiv.innerHTML = '';
+
+            // 1) Пробуем взять готовое оглавление (закладки PDF)
+            let outline = null;
+            try { outline = await pdf.getOutline(); } catch (e) {}
+
+            if (outline && outline.length > 0) {
+                await renderPDFWithOutline(pdf, outline);
+            } else {
+                await renderPDFFallback(pdf);
+            }
+
+            if (contentDiv.children.length === 0) {
+                contentDiv.innerHTML = '<p class="placeholder">В PDF не найден текст (возможно, это сканы).</p>';
+            }
+        }
+
+        // PDF с закладками: каждая закладка → якорь перед страницей
+        async function renderPDFWithOutline(pdf, outline) {
+            // Собираем карту: номер страницы → список закладок
+            const pageMap = {};
+            const destToPage = async (dest) => {
+                if (typeof dest === 'string') {
+                    return await pdf.getDestination(dest).then(d => pdf.getPageIndex(d[0])).then(i => i + 1);
+                } else if (Array.isArray(dest)) {
+                    return await pdf.getPageIndex(dest[0]).then(i => i + 1);
+                }
+                return null;
+            };
+
+            const flat = async (items, level = 1) => {
+                for (const item of items) {
+                    let pageNum = null;
+                    if (item.dest) {
+                        try { pageNum = await destToPage(item.dest); } catch (e) {}
+                    }
+                    if (pageNum) {
+                        if (!pageMap[pageNum]) pageMap[pageNum] = [];
+                        pageMap[pageNum].push({ title: item.title, level });
+                    }
+                    if (item.items && item.items.length) {
+                        await flat(item.items, level + 1);
+                    }
+                }
+            };
+            await flat(outline);
+
+            for (let i = 1; i <= pdf.numPages; i++) {
+                // Если на этой странице начинается глава — ставим заголовок
+                if (pageMap[i]) {
+                    for (const ch of pageMap[i]) {
+                        addChapter(ch.title);
+                    }
+                }
+
+                const page = await pdf.getPage(i);
+                const textContent = await page.getTextContent();
+                let pageText = '';
+                let lastY = null;
+                textContent.items.forEach(item => {
+                    const y = item.transform[5];
+                    if (lastY !== null && Math.abs(y - lastY) > 4) pageText += '\n';
+                    pageText += item.str;
+                    lastY = y;
+                });
+
+                pageText.split('\n').forEach(line => {
+                    const trimmed = line.trim();
+                    if (!trimmed) return;
+                    const p = document.createElement('p');
+                    p.textContent = trimmed;
+                    contentDiv.appendChild(p);
+                });
+            }
+        }
+
+        // PDF без закладок: аккуратная эвристика
+        async function renderPDFFallback(pdf) {
+            for (let i = 1; i <= pdf.numPages; i++) {
+                const page = await pdf.getPage(i);
+                const textContent = await page.getTextContent();
+
+                // Группируем items в строки по Y
+                const lines = [];
+                let currentLine = null;
+                let lastY = null;
+                textContent.items.forEach(item => {
+                    const y = Math.round(item.transform[5]);
+                    if (lastY === null || Math.abs(y - lastY) > 3) {
+                        if (currentLine) lines.push(currentLine);
+                        currentLine = { y, text: item.str, sizes: [item.transform[0]] };
+                    } else {
+                        currentLine.text += item.str;
+                        currentLine.sizes.push(item.transform[0]);
+                    }
+                    lastY = y;
+                });
+                if (currentLine) lines.push(currentLine);
+
+                // Вычисляем средний размер шрифта на странице
+                const allSizes = lines.flatMap(l => l.sizes);
+                const avgSize = allSizes.reduce((a, b) => a + b, 0) / (allSizes.length || 1);
+
+                lines.forEach(line => {
+                    const trimmed = line.text.trim();
+                    if (!trimmed) return;
+
+                    const lineMaxSize = Math.max(...line.sizes);
+                    const isBigFont = lineMaxSize > avgSize * 1.25;
+                    const isShort = trimmed.length < 100;
+                    const isChapterWord = /^(глава|chapter|часть|part|пролог|эпилог|prologue|epilogue)\b/i.test(trimmed);
+                    const isNumbered = /^(\d{1,3}|[IVXLCDM]{1,8})[\.\)]\s+\S/.test(trimmed);
+
+                    if (isChapterWord || (isBigFont && isShort) || (isNumbered && isShort)) {
+                        addChapter(trimmed);
+                    } else {
+                        const p = document.createElement('p');
+                        p.textContent = trimmed;
+                        contentDiv.appendChild(p);
+                    }
+                });
+            }
+        }
+
+        /* ================= EPUB ================= */
+        async function renderEPUBText(file) {
+            const buffer = await file.arrayBuffer();
+            const zip = await JSZip.loadAsync(buffer);
+
+            // OPF
+            let opfPath = null;
+            const containerFile = zip.file('META-INF/container.xml');
+            if (containerFile) {
+                const containerXml = await containerFile.async('string');
+                const match = containerXml.match(/full-path="([^"]+)"/);
+                if (match) opfPath = match[1];
+            }
+            if (!opfPath) {
+                contentDiv.innerHTML = '<p class="placeholder">Не удалось найти OPF в EPUB.</p>';
+                return;
+            }
+
+            const opfText = await zip.file(opfPath).async('string');
+            const opfDir = opfPath.includes('/') ? opfPath.substring(0, opfPath.lastIndexOf('/') + 1) : '';
+            const parser = new DOMParser();
+            const opfDoc = parser.parseFromString(opfText, 'application/xml');
+
+            const manifest = {};
+            opfDoc.querySelectorAll('manifest item').forEach(item => {
+                manifest[item.getAttribute('id')] = {
+                    href: item.getAttribute('href'),
+                    mediaType: item.getAttribute('media-type'),
+                    properties: item.getAttribute('properties') || ''
+                };
+            });
+
+            const spineItems = Array.from(opfDoc.querySelectorAll('spine itemref'))
+                .map(ref => manifest[ref.getAttribute('idref')])
+                .filter(Boolean);
+
+            contentDiv.innerHTML = '';
+
+            // 1) Пытаемся найти готовое оглавление EPUB: nav.xhtml или toc.ncx
+            const tocMap = {}; // href → [{title, level}]
+            try {
+                // EPUB3: nav.xhtml
+                let navItem = Object.values(manifest).find(m => m.properties.includes('nav'));
+                if (navItem) {
+                    const navPath = opfDir + navItem.href;
+                    const navFile = zip.file(navPath);
+                    if (navFile) {
+                        const navText = await navFile.async('string');
+                        const navDoc = parser.parseFromString(navText, 'text/html');
+                        navDoc.querySelectorAll('nav[epub\\:type="toc"] ol li, nav ol li').forEach(li => {
+                            const a = li.querySelector('a');
+                            if (!a) return;
+                            const href = a.getAttribute('href');
+                            if (!href) return;
+                            const cleanHref = href.split('#')[0];
+                            const level = li.parentElement ? (li.parentElement.tagName === 'OL' ? countNesting(li) : 1) : 1;
+                            if (!tocMap[cleanHref]) tocMap[cleanHref] = [];
+                            tocMap[cleanHref].push({ title: a.textContent.trim(), level });
+                        });
+                    }
+                }
+
+                // EPUB2: toc.ncx
+                if (!navItem) {
+                    const ncxItem = Object.values(manifest).find(m => m.mediaType === 'application/x-dtbncx+xml');
+                    if (ncxItem) {
+                        const ncxPath = opfDir + ncxItem.href;
+                        const ncxFile = zip.file(ncxPath);
+                        if (ncxFile) {
+                            const ncxText = await ncxFile.async('string');
+                            const ncxDoc = parser.parseFromString(ncxText, 'application/xml');
+                            ncxDoc.querySelectorAll('navPoint').forEach(np => {
+                                const label = np.querySelector('navLabel text');
+                                const content = np.querySelector('content');
+                                if (!label || !content) return;
+                                const src = content.getAttribute('src') || '';
+                                const cleanHref = src.split('#')[0];
+                                if (!tocMap[cleanHref]) tocMap[cleanHref] = [];
+                                tocMap[cleanHref].push({ title: label.textContent.trim(), level: 1 });
+                            });
+                        }
+                    }
+                }
+            } catch (e) {
+                console.warn('Оглавление EPUB не прочитано', e);
+            }
+
+            // 2) Проходим по spine и выводим текст
+            for (const item of spineItems) {
+                const fullPath = opfDir + item.href;
+                const htmlFile = zip.file(fullPath);
+                if (!htmlFile) continue;
+
+                const htmlText = await htmlFile.async('string');
+                const doc = parser.parseFromString(htmlText, 'text/html');
+                doc.querySelectorAll('script, style').forEach(el => el.remove());
+
+                const body = doc.body;
+                if (!body) continue;
+
+                // Если для этого файла есть запись в оглавлении — ставим главу
+                const tocEntries = tocMap[item.href];
+                if (tocEntries && tocEntries.length) {
+                    for (const entry of tocEntries) {
+                        addChapter(entry.title);
+                    }
+                }
+
+                const blocks = body.querySelectorAll('h1, h2, h3, h4, p');
+                blocks.forEach(block => {
+                    const text = block.textContent.trim();
+                    if (!text) return;
+                    const p = document.createElement('p');
+                    p.textContent = text;
+                    contentDiv.appendChild(p);
+                });
+            }
+
+            if (contentDiv.children.length === 0) {
+                contentDiv.innerHTML = '<p class="placeholder">В EPUB не найден текст.</p>';
+            }
+
+            tocDiv.hidden = tocList.children.length === 0;
+        }
+
+        function countNesting(li) {
+            let n = 1;
+            let p = li.parentElement;
+            while (p && p.tagName === 'OL') {
+                n++;
+                p = p.parentElement ? p.parentElement.parentElement : null;
+            }
+            return n;
+        }
+
+        /* ================= Восстановление ================= */
+        (async function restoreSession() {
+            try {
+                const savedFile = await loadFileFromDB();
+                if (!savedFile) return;
+                isRestoring = true;
+                contentDiv.innerHTML = '<p class="placeholder">Восстанавливаем последний файл…</p>';
+                const dt = new DataTransfer();
+                dt.items.add(savedFile);
+                fileInput.files = dt.files;
+                fileInput.dispatchEvent(new Event('change'));
+            } catch (e) {
+                console.warn('Восстановление не удалось', e);
+                isRestoring = false;
+            }
+        })();
+    </script>
+
+</body>
+</html>
